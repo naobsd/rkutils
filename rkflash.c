@@ -1,5 +1,6 @@
 /*-
  * Copyright (c) 2010, 2011 FUKAUMI Naoki.
+ * Copyright (c) 2011 Ithamar R. Adema. (added libusb support)
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -125,8 +126,78 @@ do {									\
 	(c).size = 0x20;						\
 } while(/* CONSTCOND */0)
 
-#define BULK_SEND_EP2(buf, size)	write(STDOUT_FILENO, (buf), (size))
-#define BULK_RECV_EP1(buf, size)	read(STDIN_FILENO, (buf), (size))
+static int verbose = 0;
+
+#ifdef HAS_LIBUSB
+#include <usb.h>
+
+static usb_dev_handle *xsv_handle;
+
+static int
+bulk_init(const char *device)
+{
+	struct usb_bus *bus;
+	struct usb_device *dev;
+
+
+	usb_init();
+
+	if (verbose)
+		usb_set_debug(verbose);
+
+	usb_find_busses();
+	usb_find_devices();
+
+	xsv_handle = NULL;
+	for (bus = usb_busses; bus; bus = bus->next) {
+		for (dev = bus->devices; dev; dev = dev->next) {
+			if (device && strcmp(dev->filename, device) != 0)
+				continue;
+
+			if (dev->descriptor.idVendor == 0x2207 &&
+				(dev->descriptor.idProduct == 0x290a ||
+				dev->descriptor.idProduct == 0x281a)) {
+				xsv_handle = usb_open(dev);
+				if (verbose) {
+					printf("using rockchip device @ %s\n",
+						dev->filename);
+				}
+				break;
+			}
+		}
+	}
+
+	if (xsv_handle) {
+		usb_set_configuration(xsv_handle,1);
+		usb_claim_interface(xsv_handle,0);
+		usb_set_altinterface(xsv_handle,0);
+
+		return 0;
+	} else {
+		return -1;
+	}
+}
+
+#define BULK_SEND_EP2(buf, size)	usb_bulk_write(xsv_handle, 2, (void*)buf, size, 500)
+#define BULK_RECV_EP1(buf, size)	usb_bulk_read(xsv_handle, 1, (void*)buf, size, 500)
+#else
+static int fd_in, fd_out;
+
+static int
+bulk_init(const char *device)
+{
+	if (device == NULL) {
+		fd_in = STDIN_FILENO;
+		fd_out = STDOUT_FILENO;
+	} else
+		fd_in = fd_out = open(device, O_RDWR);
+
+	return 0;
+}
+
+#define BULK_SEND_EP2(buf, size)	write(fd_out, (buf), (size))
+#define BULK_RECV_EP1(buf, size)	read(fd_in, (buf), (size))
+#endif
 
 #define _BLOCKSIZE	(16 * 1024)
 
@@ -136,7 +207,7 @@ static void
 usage(void)
 {
 
-	fprintf(stderr, "usage: %s [-B] [-r size] offset file\n", progname);
+	fprintf(stderr, "usage: %s [-D device] [-v] [-B] [-r size] offset file\n", progname);
 	exit(EXIT_FAILURE);
 }
 
@@ -149,15 +220,23 @@ main(int argc, char *argv[])
 	int32_t size;
 	uint8_t *buf;
 	int ch, img, boot;
+	const char *device = NULL;
+	int res;
 
 	progname = argv[0];
 
 	boot = 0;
 	size = 0;
-	while ((ch = getopt(argc, argv, "Br:")) != -1) {
+	while ((ch = getopt(argc, argv, "vBr:D:")) != -1) {
 		switch (ch) {
+		case 'v':
+			verbose++;
+			break;
 		case 'B':
 			boot = 1;
+			break;
+		case 'D':
+			device = strdup(optarg);
 			break;
 		case 'r':
 			size = strtoul(optarg, NULL, 0);
@@ -168,6 +247,9 @@ main(int argc, char *argv[])
 	}
 	argc -= optind;
 	argv += optind;
+
+	if (bulk_init(device) != 0)
+		errx(EXIT_FAILURE, "Failure finding device\n");
 
 	if (argc != 2)
 		usage();
@@ -194,9 +276,11 @@ main(int argc, char *argv[])
 	c.hdr[2] = 'B';
 	c.hdr[3] = 'C';
 
-	SETCMD_INIT(c);
-	BULK_SEND_EP2(&c, sizeof(c));
-	BULK_RECV_EP1(&r, sizeof(r));
+	do {
+		SETCMD_INIT(c);
+		BULK_SEND_EP2(&c, sizeof(c));
+		res = BULK_RECV_EP1(&r, sizeof(r));
+	} while(res < 0);
 
 	usleep(20 * 1000);
 #if 0
@@ -208,28 +292,32 @@ main(int argc, char *argv[])
 #endif
 	if (size == 0) {
 		while (read(img, buf, _BLOCKSIZE) > 0) {
-			fprintf(stderr, "writing offset 0x%08x\n", off);
+			if (verbose)
+				fprintf(stderr, "writing offset 0x%08x\n", off);
 
 			SETCMD_WRITE(c, off);
 			BULK_SEND_EP2(&c, sizeof(c));
 
 			BULK_SEND_EP2(buf, _BLOCKSIZE);
 
-			BULK_RECV_EP1(&r, sizeof(r));
+			if (BULK_RECV_EP1(&r, sizeof(r)) < 0)
+				fprintf(stderr, "error writing offset 0x%08x\n", off);
 
 			off += 0x20;
 			memset(buf, 0, _BLOCKSIZE);
 		}
 	} else {
 		while (size > 0) {
-			fprintf(stderr, "reading offset 0x%08x\n", off);
+			if (verbose)
+				fprintf(stderr, "reading offset 0x%08x\n", off);
 
 			SETCMD_READ(c, off);
 			BULK_SEND_EP2(&c, sizeof(c));
 
 			BULK_RECV_EP1(buf, _BLOCKSIZE);
 
-			BULK_RECV_EP1(&r, sizeof(r));
+			if (BULK_RECV_EP1(&r, sizeof(r)) < 0)
+				fprintf(stderr, "error reading offset 0x%08x\n", off);
 
 			write(img, buf, _BLOCKSIZE);
 

@@ -35,7 +35,10 @@
 #define T_CRAMFS	0
 #define T_KERNEL	1
 #define T_PARAMETER	2
-#define T_UPDATE	3
+#define T_UPDATE_AF	3
+#define T_UPDATE_FW	4
+#define T_ANDROID	5
+#define T_EXTFS		6
 
 #define _BLOCKSIZE	(16 * 1024)
 
@@ -76,7 +79,10 @@ main(int argc, char *argv[])
 	} else if (buf[0] == 'R' && buf[1] == 'K' &&
 	    buf[2] == 'A' && buf[3] == 'F') {
 		printf("update.img");
-		type = T_UPDATE;
+		type = T_UPDATE_AF;
+	} else if (strncmp((void*)buf, "ANDROID!", 8) == 0) {
+		printf("android");
+		type = T_ANDROID;
 	} else {
 		fprintf(stderr, "unknown image (%02x %02x %02x %02x)\n",
 		    buf[0], buf[1], buf[2], buf[3]);
@@ -86,6 +92,18 @@ main(int argc, char *argv[])
 	size = buf[4] | buf[5] << 8 | buf[6] << 16 | buf[7] << 24;
 	if (type == T_KERNEL || type == T_PARAMETER)
 		size += 8;
+	else if (type == T_ANDROID) {
+		unsigned pgsz, pages;
+		pgsz = buf[36] | buf[37] << 8 | buf[38] << 16 | buf[39] << 24;
+		pages = 1 /* header */ +
+		    ((buf[8] | buf[9] << 8 | buf[10] << 16 |
+		        buf[11] << 24) + pgsz - 1) / pgsz + /* kernel */
+		    ((buf[16] | buf[17] << 8 | buf[18] << 16 |
+		        buf[19] << 24) + pgsz - 1) / pgsz + /* ramdisk */
+		    ((buf[24] | buf[25] << 8 | buf[26] << 16 |
+		        buf[27] << 24) + pgsz - 1) / pgsz; /* second */
+		size = pages * pgsz;
+	}
 
 	printf(" found (%u bytes)\n", size);
 
@@ -98,7 +116,7 @@ main(int argc, char *argv[])
 		nr = size;
 
 	crc = 0;
-	if (type == T_CRAMFS || type == T_UPDATE)
+	if (type == T_CRAMFS || type == T_UPDATE_AF)
 		RKCRC(crc, buf, nr);
 	else
 		RKCRC(crc, &buf[8], nr - 8);
@@ -126,18 +144,19 @@ main(int argc, char *argv[])
 		nr = 0;
 	}
 
-	ocrc = buf[nr] | buf[nr + 1] << 8 |
-	    buf[nr + 2] << 16 | buf[nr + 3] << 24;
+	if (type != T_ANDROID) {
+		ocrc = buf[nr] | buf[nr + 1] << 8 |
+		    buf[nr + 2] << 16 | buf[nr + 3] << 24;
 
-	if (crc != ocrc)
-		goto end;
+		if (crc != ocrc)
+			goto end;
 
-	printf("crc found (4 bytes, 0x%08x)\n", ocrc);
+		printf("crc found (4 bytes, 0x%08x)\n", ocrc);
+		if (type != T_PARAMETER)
+			write(out, &buf[nr], 4);
 
-	if (type != T_PARAMETER)
-		write(out, &buf[nr], 4);
-
-	nr += 4;
+		nr += 4;
+	}
 
 	if (type == T_KERNEL) {
 		if (nr != _BLOCKSIZE) {
